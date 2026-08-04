@@ -30,10 +30,46 @@ Key facts to remember:
 python3 -S etcdbrowser.py status <snapshot.db>       # verify
 python3 -S etcdbrowser.py open   <snapshot.db>       # restore + serve on 127.0.0.1:22379
 python3 -S etcdbrowser.py browse                     # curses TUI
-python3 -S etcdbrowser.py export <prefix> <out.json> # headless export
+python3 -S etcdbrowser.py export <prefix> <out.json> # headless export (single file)
+python3 -S etcdbrowser.py export-tree <outdir>       # one file per leaf (see below)
 python3 -S etcdbrowser.py close [--keep-data]        # stop etcd
 python3 -S etcdbrowser.py --version
 ```
+
+## export-tree
+
+`export-tree <outdir> [--layout objects|keys] [--format json|yaml]
+[--prefix P] [--summary FILE]` writes the whole snapshot (or a `--prefix`
+subtree) as a directory of files, one per leaf.
+
+- `--layout objects` (default, OpenShift style): `namespace/kind/name`, with
+  cluster-scoped objects under `(cluster-scoped)` and non-object values under
+  `(raw)`. k8s values are written as clean `{apiVersion, kind, ...}` manifests
+  (apply-able via `oc apply -f`).
+- `--layout keys`: mirrors the etcd storage key trie (`kubernetes.io/...`,
+  `openshift.io/...`).
+- `--format json|yaml` (default json). Leaves are never dropped; object names
+  are sanitised and same-path collisions suffixed with `-2`, `-3`, …
+- `--summary FILE` also writes a JSON summary embedding `verify`-style decode /
+  adherence stats.
+
+Implementation lives in `etcdbrowser/exporttree.py` (reuses `decode.py`,
+`objects.py`, `yamlout.py`, `verify.py`).
+
+## Testing (run before a release)
+
+- `make test` — fast stdlib-only **unit tests** (`test/test_export_tree.py`
+  uses an in-memory `FakeKVClient`, no etcd needed).
+- `make release-test` — the full gate: unit **plus** integration
+  (`test/test_integration.py`) against a real snapshot (the bundled backup
+  auto-opens if `etcd`/`etcdctl` are installed). It exports in both layouts
+  and both formats, checks every JSON/YAML leaf parses, and asserts **>= 90 %
+  of useful objects decode with metadata intact** (0 unknown protobuf fields).
+- `test/helpers.py` builds synthetic `k8s\x00` runtime.Unknown protobuf values
+  and a `FakeKVClient` for fixtures.
+- Full plan: `doc/functionnal_test.md`. Individual YAML round-trips use PyYAML
+  when available (`python3 -m unittest`); under `python3 -S` YAML tests fall
+  back to structural checks.
 
 ## Gotchas for TUI work
 

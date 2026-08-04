@@ -24,6 +24,7 @@ import sys
 from etcdbrowser import backend
 from etcdbrowser.backend import KVClient, BackendError
 from etcdbrowser import decode
+from etcdbrowser import exporttree
 from etcdbrowser import tui
 from etcdbrowser import verify
 from etcdbrowser import __version__
@@ -85,6 +86,24 @@ def cmd_export(args) -> None:
     print("exported %d keys to %s" % (n, args.outfile))
 
 
+def cmd_export_tree(args) -> None:
+    state = backend.read_state()
+    if not state or not backend._pid_alive(state.get("pid")):
+        die("no etcd running. Run: etcdbrowser.py open <snapshot.db>")
+    client = KVClient(state["client_url"])
+    try:
+        stats = exporttree.export_tree(client, args.outdir, layout=args.layout,
+                                       fmt=args.fmt, prefix=args.prefix)
+    except exporttree.ExportError as exc:
+        die(str(exc))
+    print(exporttree.render_summary(stats))
+    if args.summary:
+        with open(args.summary, "w", encoding="utf-8") as fh:
+            json.dump(exporttree.json_safe(stats), fh, indent=2,
+                      ensure_ascii=False, default=str)
+        print("summary written to %s" % args.summary)
+
+
 def cmd_verify(args) -> None:
     state = backend.read_state()
     if not state or not backend._pid_alive(state.get("pid")):
@@ -135,6 +154,20 @@ def main(argv=None) -> int:
     p.add_argument("prefix")
     p.add_argument("outfile")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("export-tree",
+                       help="export the tree to a directory of files, one per leaf")
+    p.add_argument("outdir", help="output directory (created if missing)")
+    p.add_argument("--layout", choices=["keys", "objects"], default="objects",
+                   help="keys = mirror the etcd storage trie; "
+                        "objects = OpenShift-style namespace/kind/name tree (default)")
+    p.add_argument("--format", choices=["json", "yaml"], default="json", dest="fmt",
+                   help="file format for the leaves (default json)")
+    p.add_argument("--prefix", default="/",
+                   help="only export keys under this prefix (default /; keys layout only)")
+    p.add_argument("--summary", metavar="FILE",
+                   help="also write a JSON summary with decode/validation stats")
+    p.set_defaults(func=cmd_export_tree)
 
     p = sub.add_parser("verify",
                        help="report how well the decode schemas match the snapshot")

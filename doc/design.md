@@ -47,8 +47,10 @@ etcdbrowser/
   decode.py                   protobuf parser + value decoding
   schemas.py                  k8s/OpenShift field-number schemas
   objects.py                  object view builder (namespace/kind/name tree)
+  exporttree.py               tree export: layouts (objects/keys) x formats
   verify.py                   decode-adherence report (verify command)
   tui.py                      curses browser
+  test/                       release tests (see doc/functionnal_test.md)
 ```
 
 Data flow:
@@ -200,6 +202,14 @@ serve the snapshot).
 - `open <snapshot.db> [--client-port N]` — restore + serve, prints state.
 - `browse` — curses browser (requires a running etcd).
 - `export <prefix> <out.json>` — headless export.
+- `export-tree <outdir> [--layout objects|keys] [--format json|yaml]
+  [--prefix P] [--summary FILE]` — write the whole snapshot (or a `--prefix`
+  subtree) as a directory of files, one per leaf. `objects` = OpenShift-style
+  `namespace/kind/name` (cluster-scoped under `(cluster-scoped)`, non-objects
+  under `(raw)`); `keys` = the raw etcd storage trie. k8s leaves are clean
+  `{apiVersion, kind, ...}` manifests. Leaves are never dropped; names are
+  sanitised and collisions suffixed. See `exporttree.py` and
+  `doc/functionnal_test.md`.
 - `verify [--kinds N] [--json out.json]` — decode-adherence report: scans the
   snapshot and reports, per kind, unknown field numbers and wire-type
   mismatches vs the bundled schemas. Run it on any snapshot to confirm the
@@ -230,8 +240,34 @@ serve the snapshot).
   JobCondition, DeploymentCondition, ContainerStatus, NodeCondition, Taint,
   …) have their own schemas too.
 
-## 9. Key observations on the bundled snapshot
+## 8.5 Tree export and release tests
 
+- **`exporttree.py`** turns the whole snapshot (or a `--prefix` subtree) into a
+  directory of files, one per leaf. Two layouts:
+  - `objects` (OpenShift style): `namespace/kind/name` via
+    `objects.segments_for`, with cluster-scoped objects under `(cluster-scoped)`
+    and non-objects under `(raw)`. k8s leaves are written as clean
+    `{apiVersion, kind, ...object}` manifests (apply-able via `oc apply -f`);
+  - `keys`: mirrors the storage key trie.
+  Formats are JSON or YAML (`yamlout.py`). Names are sanitised to safe
+  file-name characters (the `(cluster-scoped)`/`(raw)` sentinels are kept
+  verbatim) and same-path collisions are suffixed `-2`, `-3`, …. Leaves are
+  never dropped — raw bytes are written under `(raw)` as their full decode
+  envelope.
+- **Stats / summary**: `export_tree` returns `{values, files, formats,
+  k8s{with_metadata,...}, objects{...}, raw, decoded_ratio, object_ratio,
+  by_kind, adherence}`. `object_ratio` is computed over object-shaped values
+  only (raw bytes are excluded, since they are internal markers, not objects),
+  so it measures decode *quality*, not leaf count. `--summary FILE` writes it
+  as JSON (with the `verify.analyze` adherence report embedded).
+- **Release tests** (`make test`, `make release-test`) — see
+  `doc/functionnal_test.md`. Unit tests run against a `FakeKVClient`
+  (`test/helpers.py`) that fabricates real `k8s\x00` runtime.Unknown protobuf
+  envelopes; integration tests run against the bundled snapshot and assert
+  one file per leaf, valid JSON/YAML, and `>= 90 %` of useful objects decoded
+  with metadata (the bundle is 100 %, 0 unknown fields).
+
+## 9. Key observations on the bundled snapshot
 - `snapshot_2026-08-04_150427.db`, 101 MB, hash `4f9242b6`, 22,010 revisions.
 - 12,525 keys under `/` (12,526 with the internal `compact_rev_key`, which is
   correctly excluded because it does not start with `/`); gateway + etcdctl
