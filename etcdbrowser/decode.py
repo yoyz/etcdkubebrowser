@@ -200,18 +200,21 @@ def decode_message(buf: bytes, schema) -> dict[str, object]:
             out[name] = generic_value(val, wt)
             continue
         name, type_ = spec
-        if type_[0] == "rep":
-            items = out.setdefault(name, [])
-            if not isinstance(items, list):
-                items = out[name] = [items]
-            items.append(_conv(type_[1], val, wt))
-        elif type_[0] == "map":
-            merged = out.setdefault(name, {})
-            if not isinstance(merged, dict):
-                merged = out[name] = {}
-            merged.update(_conv(type_, val, wt))
-        else:
-            out[name] = _conv(type_, val, wt)
+        try:
+            if type_[0] == "rep":
+                items = out.setdefault(name, [])
+                if not isinstance(items, list):
+                    items = out[name] = [items]
+                items.append(_conv(type_[1], val, wt))
+            elif type_[0] == "map":
+                merged = out.setdefault(name, {})
+                if not isinstance(merged, dict):
+                    merged = out[name] = {}
+                merged.update(_conv(type_, val, wt))
+            else:
+                out[name] = _conv(type_, val, wt)
+        except DecodeError:
+            out[name] = generic_value(val, wt)
     return out
 
 

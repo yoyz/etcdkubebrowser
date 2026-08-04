@@ -8,44 +8,14 @@ from __future__ import annotations
 import curses
 import json
 import os
+import shlex
+import shutil
+import subprocess
 
 from . import decode
+from . import yamlout
 from .backend import KVClient
-
-
-class Node:
-    __slots__ = ("name", "children", "parent", "key", "count")
-
-    def __init__(self, name: str, parent: "Node | None" = None):
-        self.name = name
-        self.children: dict[str, Node] = {}
-        self.parent = parent
-        self.key: bytes | None = None
-        self.count = 0
-
-    def is_leaf(self) -> bool:
-        return self.key is not None
-
-
-def build_tree(keys: list[bytes]) -> Node:
-    root = Node("/")
-    for key in keys:
-        node = root
-        segments = [s for s in key.decode("utf-8", errors="replace").split("/") if s]
-        for seg in segments[:-1]:
-            child = node.children.get(seg)
-            if child is None:
-                child = Node(seg, parent=node)
-                node.children[seg] = child
-            node = child
-            node.count += 1
-        leaf = node.children.get(segments[-1])
-        if leaf is None:
-            leaf = Node(segments[-1], parent=node)
-            node.children[segments[-1]] = leaf
-        leaf.key = key
-        leaf.count += 1
-    return root
+from .objects import Node, build_tree, object_paths
 
 
 def wrap_lines(lines, width: int) -> list[str]:
@@ -68,13 +38,16 @@ def wrap_lines(lines, width: int) -> list[str]:
 
 
 class Browser:
-    def __init__(self, client: KVClient, snapshot: str):
+    def __init__(self, client: KVClient, snapshot: str, view: str = "keys"):
         self.client = client
         self.snapshot = snapshot
+        self.view = view
         self.root = Node("/")
         self.all_keys: list[bytes] = []
         self.filter = ""
         self.filtered_keys: list[bytes] = []
+        self.entries: list[tuple[bytes, bytes | None]] = []
+        self.obj_entries: list[tuple[bytes, bytes]] | None = None
         self.expanded: set[Node] = set()
         self.visible: list[Node] = []
         self.sel = 0
@@ -86,22 +59,45 @@ class Browser:
         self._H = 24
         self._W = 80
         self.status = ""
+        self.value_fmt = "json"
         self.export_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                        "tmp", "export")
 
     # ------------------------------------------------------------ loading --
 
-    def load(self) -> None:
+    def load(self, stdscr=None) -> None:
         self.all_keys = [k for k, _ in self.client.iter_range(b"/", keys_only=True)]
-        self.apply_filter()
+        self.apply_filter(stdscr)
 
-    def apply_filter(self) -> None:
-        if self.filter:
-            needle = self.filter.encode("utf-8")
-            self.filtered_keys = [k for k in self.all_keys if needle in k]
+    def ensure_objects(self, stdscr=None) -> None:
+        if self.obj_entries is not None:
+            return
+        self.obj_entries = []
+        n = 0
+        for item in object_paths(self.client):
+            self.obj_entries.append(item)
+            n += 1
+            if stdscr is not None and n % 150 == 0:
+                self.status = "indexing objects... %d keys" % n
+                self.draw(stdscr)
+        self.status = ""
+
+    def apply_filter(self, stdscr=None) -> None:
+        needle = self.filter.encode("utf-8") if self.filter else None
+        if self.view == "objects":
+            self.ensure_objects(stdscr)
+            assert self.obj_entries is not None
+            if needle is None:
+                self.entries = list(self.obj_entries)
+            else:
+                self.entries = [(p, k) for p, k in self.obj_entries if needle in p]
         else:
-            self.filtered_keys = list(self.all_keys)
-        self.root = build_tree(self.filtered_keys)
+            if needle is None:
+                keys = list(self.all_keys)
+            else:
+                keys = [k for k in self.all_keys if needle in k]
+            self.entries = [(k, k) for k in keys]
+        self.root = build_tree(self.entries)
         self.expanded = set()
 
         def expand(node: Node, depth: int) -> None:
@@ -111,11 +107,17 @@ class Browser:
                 self.expanded.add(child)
                 expand(child, depth + 1)
 
-        expand(self.root, 0)
+        if self.view == "keys":
+            expand(self.root, 0)
         self.sel = 0
         self.top = 0
         self.voff = 0
         self.recompute_visible()
+
+    def toggle_view(self, stdscr=None) -> None:
+        self.view = "keys" if self.view == "objects" else "objects"
+        self.filter = ""
+        self.apply_filter(stdscr)
 
     def recompute_visible(self) -> None:
         self.visible = []
@@ -204,6 +206,14 @@ class Browser:
         self.value_cache[key] = decoded
         return decoded
 
+    def _render_obj(self, obj, width: int) -> list[str]:
+        if self.value_fmt == "yaml":
+            try:
+                return yamlout.dumps(obj).split("\n")
+            except Exception as exc:
+                return ["<yaml render error: %s>" % exc]
+        return _json_lines(obj, width)
+
     def value_lines(self, width: int) -> list[str]:
         node = self.current()
         if node is None:
@@ -223,6 +233,7 @@ class Browser:
                 lines.append("REV   create=%s mod=%s version=%s lease=%s size=%sB" % (
                     meta.get("create_revision"), meta.get("mod_revision"),
                     meta.get("version"), meta.get("lease"), meta.get("size")))
+                lines.append("FMT   %s view  (y toggles json/yaml)" % self.value_fmt)
                 lines.append("-" * max(width, 10))
                 if fmt == "k8s":
                     lines.append("KIND  %s (%s)" % (data.get("kind"), data.get("apiVersion")))
@@ -231,12 +242,12 @@ class Browser:
                         m = obj.get("metadata") or {}
                         lines.append("OBJ   %s/%s  ns=%s" % (m.get("name"), m.get("uid"), m.get("namespace")))
                     lines.append("")
-                    lines.extend(_json_lines(obj, width))
+                    lines.extend(self._render_obj(obj, width))
                 elif fmt == "json":
-                    lines.extend(_json_lines(data.get("data"), width))
+                    lines.extend(self._render_obj(data.get("data"), width))
                 else:
                     lines.append("RAW   base64, %s bytes" % data.get("size", 0))
-                    lines.extend(_json_lines(data.get("data"), width))
+                    lines.extend(self._render_obj(data.get("data"), width))
         else:
             prefix = self.prefix_of(node)
             lines.append("PATH  %s" % prefix.decode("utf-8", errors="replace"))
@@ -257,47 +268,135 @@ class Browser:
         if n:
             self.voff = max(0, min(n - 1, self.voff + delta))
 
-    # ------------------------------------------------------------- export --
+    # ------------------------------------------------------- edit / export --
 
-    def export_path(self, prefix: str) -> str:
-        safe = prefix.strip("/").replace("/", "__")
-        if not safe:
-            safe = "all"
+    def _safe_name(self, name: str) -> str:
+        safe = name.strip("/").replace("/", "__")
+        return safe or "all"
+
+    def export_path(self, prefix: str, fmt: str = "json") -> str:
         os.makedirs(self.export_dir, exist_ok=True)
-        return os.path.join(self.export_dir, "%s.json" % safe)
+        return os.path.join(self.export_dir, "%s.%s" % (self._safe_name(prefix), fmt))
 
-    def export_leaf(self, node: Node) -> str:
-        if node.key is None:
-            raise ValueError("internal node: use subtree export")
-        data = self.fetch(node.key)
-        path = self.export_path(node.key.decode("utf-8", errors="replace"))
+    def _write_obj(self, path: str, obj, fmt: str) -> None:
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False, default=str)
-        return path
+            if fmt == "yaml":
+                fh.write(yamlout.dumps(obj))
+            else:
+                json.dump(obj, fh, indent=2, ensure_ascii=False, default=str)
 
-    def export_subtree(self, prefix: bytes) -> str:
+    def _leaf_payload(self, key: bytes):
+        """The decoded object itself (not the ``format``/``_meta`` envelope).
+
+        For ``k8s`` values this merges apiVersion/kind on top of the decoded
+        object so the result reads as a proper manifest; for plain JSON (CRDs)
+        it is the parsed document; for raw bytes it is the base64 blob.
+        """
+        data = self.fetch(key)
+        if data is None:
+            return None
+        fmt = data.get("format")
+        if fmt == "k8s":
+            out = {"apiVersion": data.get("apiVersion"), "kind": data.get("kind")}
+            obj = data.get("object") or {}
+            if isinstance(obj, dict):
+                out.update(obj)
+            return out
+        if fmt == "json":
+            return data.get("data")
+        return data.get("data")
+
+    def _current_data(self, node: Node):
+        if node.is_leaf():
+            return self._leaf_payload(node.key)
+        if self.view == "objects":
+            keys = [k for k in self._subtree_keys(node) if k is not None]
+            sub = {k.decode("utf-8", errors="replace"): self._leaf_payload(k) for k in keys}
+            return {"count": len(sub), "entries": sub}
+        prefix = self.prefix_of(node)
         out: dict = {}
         n = 0
         for key, value in self.client.iter_range(prefix, keys_only=False):
             out[key.decode("utf-8", errors="replace")] = decode.decode_value(value)
             n += 1
-        path = self.export_path(prefix.decode("utf-8", errors="replace"))
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"count": n, "entries": out}, fh, indent=2, ensure_ascii=False, default=str)
-        return path
+        return {"count": n, "entries": out}
 
-    def export(self, subtree: bool) -> None:
+    def _export_path_for_node(self, node: Node, fmt: str) -> str:
+        if node.is_leaf():
+            return self.export_path(node.key.decode("utf-8", errors="replace"), fmt)
+        return self.export_path(self.prefix_of(node).decode("utf-8", errors="replace"), fmt)
+
+    def export_interactive(self, stdscr) -> None:
+        node = self.current()
+        if node is None:
+            return
+        res = self.prompt(stdscr, "export format (json/yaml)")
+        if res is None:
+            return
+        fmt = res.strip().lower()
+        if fmt not in ("json", "yaml"):
+            self.status = "export cancelled (bad format %r)" % fmt
+            return
+        self.export(fmt)
+
+    def export(self, fmt: str = "json") -> None:
         node = self.current()
         if node is None:
             return
         try:
-            if node.is_leaf():
-                path = self.export_leaf(node)
-            else:
-                path = self.export_subtree(self.prefix_of(node))
+            path = self._export_path_for_node(node, fmt)
+            self._write_obj(path, self._current_data(node), fmt)
             self.status = "exported -> %s" % path
         except Exception as exc:
             self.status = "export failed: %s" % exc
+
+    def _pick_editor(self) -> str | None:
+        env = os.environ.get("EDITOR")
+        if env:
+            parts = shlex.split(env)
+            if parts:
+                return parts[0]
+        for name in ("nano", "vi", "vim"):
+            if shutil.which(name):
+                return name
+        return None
+
+    def launch_editor(self, stdscr) -> None:
+        node = self.current()
+        if node is None:
+            return
+        try:
+            editor = self._pick_editor()
+            if editor is None:
+                self.status = "no editor found (set $EDITOR or install nano/vi/vim)"
+                return
+            data = self._current_data(node)
+            fmt = self.value_fmt
+            path = self._export_path_for_node(node, fmt)
+            self._write_obj(path, data, fmt)
+            curses.def_prog_mode()
+            curses.endwin()
+            try:
+                subprocess.call([editor, path])
+            finally:
+                curses.reset_prog_mode()
+                stdscr.refresh()
+            self.status = "edited -> %s" % path
+        except Exception as exc:
+            self.status = "editor failed: %s" % exc
+
+    def _subtree_keys(self, node: Node) -> list[bytes]:
+        """Every etcd key below ``node`` (leaf keys only)."""
+        keys: list[bytes] = []
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if cur.is_leaf():
+                if cur.key is not None:
+                    keys.append(cur.key)
+            else:
+                stack.extend(cur.children.values())
+        return keys
 
     # -------------------------------------------------------------- input --
 
@@ -324,7 +423,9 @@ class Browser:
         curses.curs_set(0)
         stdscr.keypad(True)
         stdscr.timeout(300)
-        self.load()
+        self._H, self._W = stdscr.getmaxyx()
+        self._view_h = max(1, self._H - 2)
+        self.load(stdscr)
         while True:
             H, W = stdscr.getmaxyx()
             self._H, self._W = H, W
@@ -366,11 +467,18 @@ class Browser:
                 res = self.prompt(stdscr, "filter")
                 if res is not None:
                     self.filter = res
-                    self.apply_filter()
+                    self.apply_filter(stdscr)
+            elif ch in (ord("t"), ord("T")):
+                self.toggle_view(stdscr)
+            elif ch in (ord("y"),):
+                self.value_fmt = "yaml" if self.value_fmt == "json" else "json"
+                self._val_lines = []
+                self._val_node_id = None
+                self.voff = 0
             elif ch in (ord("e"),):
-                self.export(subtree=False)
+                self.launch_editor(stdscr)
             elif ch in (ord("E"),):
-                self.export(subtree=True)
+                self.export_interactive(stdscr)
             elif ch in (ord("c"),):
                 self.value_cache.clear()
                 self._val_lines = []
@@ -388,8 +496,8 @@ class Browser:
         stdscr.attron(curses.A_BOLD)
         stdscr.addnstr(0, 0, " etcd backup browser ".center(left_w, "="), left_w)
         stdscr.attroff(curses.A_BOLD)
-        head = " %s | keys %d | filter: %r " % (
-            os.path.basename(self.snapshot), len(self.all_keys), self.filter)
+        head = " %s | view %s | keys %d | filter: %r " % (
+            os.path.basename(self.snapshot), self.view, len(self.all_keys), self.filter)
         stdscr.addnstr(0, left_w + 1, head, right_w, curses.A_BOLD)
         # separator
         stdscr.vline(1, left_w, curses.ACS_VLINE, H - 2)
@@ -424,7 +532,7 @@ class Browser:
         info = ""
         if node is not None:
             info = node.name if node.is_leaf() else "%s/ (%d keys)" % (node.name, node.count)
-        status = " %s | j/k move  enter expand  / filter  e export  E subtree  [ ] value-scroll  q quit" % info
+        status = " %s | j/k move  enter expand  / filter  t view  y json/yaml  e edit  E export  [ ] scroll  q quit" % info
         if total > view_h:
             status += "  [%d-%d/%d]" % (self.voff, self.voff + view_h - 1, total)
         if self.status:
@@ -462,10 +570,12 @@ class Browser:
             "  Enter / Right / l  expand / collapse a node",
             "  Left / h           collapse node, or jump to parent",
             "  /                  filter keys by substring (empty = clear)",
+            "  t                  toggle keys <-> objects view",
+            "  y                  toggle JSON / YAML in the value view",
             "  [  ]               scroll the value view",
             "  g / G              go to first / last row",
-            "  e                  export selected object (decoded JSON)",
-            "  E                  export whole subtree under the selection",
+            "  e                  open current object in $EDITOR (nano/vi/vim)",
+            "  E                  export current entry (asks json/yaml)",
             "  c                  clear value cache",
             "  ?                  this help",
             "  q                  quit",
@@ -489,8 +599,8 @@ def _json_lines(obj, width: int) -> list[str]:
     return text.split("\n")
 
 
-def run(client: KVClient, snapshot: str) -> int:
-    browser = Browser(client, snapshot)
+def run(client: KVClient, snapshot: str, view: str = "keys") -> int:
+    browser = Browser(client, snapshot, view=view)
     try:
         return curses.wrapper(browser.run)
     except KeyboardInterrupt:

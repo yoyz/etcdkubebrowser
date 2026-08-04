@@ -25,6 +25,7 @@ from etcdbrowser import backend
 from etcdbrowser.backend import KVClient, BackendError
 from etcdbrowser import decode
 from etcdbrowser import tui
+from etcdbrowser import verify
 from etcdbrowser import __version__
 
 
@@ -61,7 +62,7 @@ def cmd_browse(args) -> None:
         client.count(b"/")
     except BackendError as exc:
         die(str(exc))
-    tui.run(client, state.get("snapshot", ""))
+    tui.run(client, state.get("snapshot", ""), view=args.view)
 
 
 def cmd_export(args) -> None:
@@ -82,6 +83,25 @@ def cmd_export(args) -> None:
         json.dump({"count": n, "entries": out}, fh, indent=2, ensure_ascii=False,
                   default=str)
     print("exported %d keys to %s" % (n, args.outfile))
+
+
+def cmd_verify(args) -> None:
+    state = backend.read_state()
+    if not state or not backend._pid_alive(state.get("pid")):
+        die("no etcd running. Run: etcdbrowser.py open <snapshot.db>")
+    client = KVClient(state["client_url"])
+    try:
+        report = verify.analyze(client)
+    except BackendError as exc:
+        die(str(exc))
+    text = verify.render(report, kind_limit=args.kinds)
+    print(text)
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump({k: v for k, v in report.items() if k != "kinds"},
+                      fh, indent=2, default=str)
+            print("report written to %s" % args.json)
+
 
 
 def cmd_close(args) -> None:
@@ -107,12 +127,22 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_open)
 
     p = sub.add_parser("browse", help="interactive curses browser")
+    p.add_argument("--view", choices=["keys", "objects"], default="keys",
+                   help="initial view: keys (etcd storage) or objects (k8s model)")
     p.set_defaults(func=cmd_browse)
 
     p = sub.add_parser("export", help="export all keys under a prefix to JSON")
     p.add_argument("prefix")
     p.add_argument("outfile")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("verify",
+                       help="report how well the decode schemas match the snapshot")
+    p.add_argument("--kinds", type=int, default=12,
+                   help="how many kinds to list in the report (default 12)")
+    p.add_argument("--json", metavar="OUT.json",
+                   help="also write the aggregate stats to a JSON file")
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("close", help="stop the served etcd")
     p.add_argument("--keep-data", action="store_true")
